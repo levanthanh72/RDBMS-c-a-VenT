@@ -1,0 +1,404 @@
+import { movies as staticMovies, showtimes as staticShowtimes } from "../data/movies";
+import type { Movie, Showtime } from "../data/movies";
+import { 
+  checkBackendOnline, getShowtimesAPI, getTicketsAPI, 
+  getSeatLocksAPI, addSeatLockAPI, removeSeatLockAPI, clearSeatLocksForTransactionAPI,
+  deleteTicketAPI 
+} from "./api";
+
+export interface BookedTicket {
+  id: string;
+  showtimeId?: number;
+  movieId: number;
+  movieTitle: string;
+  moviePoster: string;
+  cinemaName: string;
+  showtimeDate: string;
+  showtimeTime: string;
+  hall: string;
+  seats: string[];
+  totalPrice: number;
+  paymentMethod: string;
+  bookedAt: string;
+  status: 'valid' | 'used' | 'canceled';
+  userEmail: string | null;
+  combos?: { name: string; quantity: number; price: number }[];
+}
+
+export function initializeDB() {
+  const getLocalDateString = (offsetDays = 0) => {
+    const d = new Date();
+    d.setDate(d.getDate() + offsetDays);
+    const year = d.getFullYear();
+    const month = String(d.getMonth() + 1).padStart(2, '0');
+    const day = String(d.getDate()).padStart(2, '0');
+    return `${year}-${month}-${day}`;
+  };
+
+  const day0 = getLocalDateString(0); // Today
+
+  if (!localStorage.getItem("movies_db")) {
+    localStorage.setItem("movies_db", JSON.stringify(staticMovies));
+  } else {
+    // Sync movie release dates and merge any newly added static movies (with self-healing for ID collisions)
+    try {
+      let storedMovies = JSON.parse(localStorage.getItem("movies_db") || "[]") as Movie[];
+      
+      if (localStorage.getItem("backend_synced") !== "true") {
+        // Filter out stored movies that don't match the title of the static movie (collisions)
+        storedMovies = storedMovies.filter((m) => {
+          const staticM = staticMovies.find((sm) => sm.id === m.id);
+          if (staticM) {
+            return staticM.title === m.title;
+          }
+          return true;
+        });
+
+        const updatedMovies = storedMovies.map((m: any) => {
+          const staticMovie = staticMovies.find((sm) => sm.id === m.id);
+          if (staticMovie) {
+            return { ...m, releaseDate: staticMovie.releaseDate };
+          }
+          return m;
+        });
+        const missingStaticMovies = staticMovies.filter(
+          (sm) => !storedMovies.some((m) => m.id === sm.id)
+        );
+        localStorage.setItem("movies_db", JSON.stringify([...updatedMovies, ...missingStaticMovies]));
+      }
+    } catch (e) {
+      localStorage.setItem("movies_db", JSON.stringify(staticMovies));
+    }
+  }
+
+  // Check if showtimes in localStorage contain today. If outdated, auto-refresh!
+  let showtimes = staticShowtimes;
+  const storedShowtimesStr = localStorage.getItem("showtimes_db");
+  let hasValidToday = false;
+  if (storedShowtimesStr) {
+    try {
+      const parsed = JSON.parse(storedShowtimesStr) as Showtime[];
+      if (Array.isArray(parsed) && parsed.some(s => s.date === day0)) {
+        hasValidToday = true;
+        showtimes = parsed;
+      }
+    } catch {
+      hasValidToday = false;
+    }
+  }
+
+  if (!hasValidToday) {
+    showtimes = staticShowtimes;
+    localStorage.removeItem("backend_synced");
+  }
+  localStorage.setItem("showtimes_db", JSON.stringify(showtimes));
+
+  if (!localStorage.getItem("tickets_db")) {
+    localStorage.setItem("tickets_db", JSON.stringify([]));
+  }
+}
+
+export function loadMovies(): Movie[] {
+  initializeDB();
+  try {
+    return JSON.parse(localStorage.getItem("movies_db") || "[]");
+  } catch {
+    return staticMovies;
+  }
+}
+
+export function saveMovies(movies: Movie[]) {
+  localStorage.setItem("movies_db", JSON.stringify(movies));
+}
+
+export function loadShowtimes(): Showtime[] {
+  initializeDB();
+  try {
+    return JSON.parse(localStorage.getItem("showtimes_db") || "[]");
+  } catch {
+    return staticShowtimes;
+  }
+}
+
+export function saveShowtimes(showtimes: Showtime[]) {
+  localStorage.setItem("showtimes_db", JSON.stringify(showtimes));
+}
+
+export function loadTickets(): BookedTicket[] {
+  initializeDB();
+  try {
+    return JSON.parse(localStorage.getItem("tickets_db") || "[]");
+  } catch {
+    return [];
+  }
+}
+
+export function saveTicket(ticket: BookedTicket) {
+  const tickets = loadTickets();
+  tickets.unshift(ticket); // Add new ticket to the beginning
+  localStorage.setItem("tickets_db", JSON.stringify(tickets));
+}
+
+export function updateTicketStatus(id: string, status: 'valid' | 'used'): boolean {
+  const tickets = loadTickets();
+  const index = tickets.findIndex(t => t.id === id);
+  if (index !== -1) {
+    tickets[index].status = status;
+    localStorage.setItem("tickets_db", JSON.stringify(tickets));
+    return true;
+  }
+  return false;
+}
+
+export async function deleteTicket(id: string): Promise<boolean> {
+  const tickets = loadTickets();
+  const filtered = tickets.filter(t => t.id !== id);
+  localStorage.setItem("tickets_db", JSON.stringify(filtered));
+
+  try {
+    const online = await checkBackendOnline();
+    if (online) {
+      await deleteTicketAPI(id);
+      await syncWithBackend();
+    }
+    return true;
+  } catch (err) {
+    console.error("Failed to delete ticket from backend:", err);
+    return false;
+  }
+}
+
+export interface SeatLock {
+  id: string;
+  showtimeId: number;
+  seatId: string;
+  lockedAt: number;
+  expiresAt: number;
+  transactionId: string;
+  status: 'pending' | 'sold';
+}
+
+export function initializeLocks() {
+  if (!localStorage.getItem("seat_locks_db")) {
+    localStorage.setItem("seat_locks_db", JSON.stringify([]));
+  }
+}
+
+export function loadSeatLocks(): SeatLock[] {
+  initializeLocks();
+  try {
+    const locks = JSON.parse(localStorage.getItem("seat_locks_db") || "[]") as SeatLock[];
+    const now = Date.now();
+    const validLocks = locks.filter(l => l.expiresAt > now);
+    if (validLocks.length !== locks.length) {
+      localStorage.setItem("seat_locks_db", JSON.stringify(validLocks));
+    }
+    return validLocks;
+  } catch {
+    return [];
+  }
+}
+
+export function saveSeatLocks(locks: SeatLock[]) {
+  localStorage.setItem("seat_locks_db", JSON.stringify(locks));
+}
+
+export function addSeatLock(
+  showtimeId: number, 
+  seatId: string, 
+  transactionId: string, 
+  status: 'pending' | 'sold' = 'pending', 
+  durationMs: number = 600000
+): SeatLock {
+  const locks = loadSeatLocks();
+  const now = Date.now();
+  
+  const filtered = locks.filter(l => !(l.showtimeId === showtimeId && l.seatId === seatId));
+  
+  const newLock: SeatLock = {
+    id: Math.random().toString(36).substring(2, 9),
+    showtimeId,
+    seatId,
+    lockedAt: now,
+    expiresAt: now + durationMs,
+    transactionId,
+    status
+  };
+  
+  filtered.push(newLock);
+  saveSeatLocks(filtered);
+
+  // Sync to backend asynchronously
+  addSeatLockAPI(showtimeId, seatId, transactionId, status, durationMs)
+    .catch(err => console.error("Failed to sync added lock to backend:", err));
+
+  return newLock;
+}
+
+export function removeSeatLock(showtimeId: number, seatId: string) {
+  const locks = loadSeatLocks();
+  const filtered = locks.filter(l => !(l.showtimeId === showtimeId && l.seatId === seatId));
+  saveSeatLocks(filtered);
+
+  // Sync to backend asynchronously
+  removeSeatLockAPI(showtimeId, seatId)
+    .catch(err => console.error("Failed to sync removed lock from backend:", err));
+}
+
+export function clearSeatLocksForTransaction(transactionId: string) {
+  const locks = loadSeatLocks();
+  const filtered = locks.filter(l => l.transactionId !== transactionId);
+  saveSeatLocks(filtered);
+
+  // Sync to backend asynchronously
+  clearSeatLocksForTransactionAPI(transactionId)
+    .catch(err => console.error("Failed to sync cleared transaction locks from backend:", err));
+}
+
+export function isSeatLocked(showtimeId: number, seatId: string, currentTxId?: string): boolean {
+  const locks = loadSeatLocks();
+  const now = Date.now();
+  return locks.some(
+    l => l.showtimeId === showtimeId && 
+         l.seatId === seatId && 
+         l.transactionId !== currentTxId && 
+         l.expiresAt > now
+  );
+}
+
+export interface RoomConfig {
+  id: string;
+  name: string;
+  cinemaId: number;
+  rows: number;
+  cols: number;
+  seats: Record<string, 'standard' | 'vip' | 'couple'>;
+}
+
+export interface SeatPricingConfig {
+  vipMultiplier: number;
+  coupleMultiplier: number;
+}
+
+export function loadRooms(): RoomConfig[] {
+  const stored = localStorage.getItem("rooms_db");
+  if (stored) {
+    try {
+      return JSON.parse(stored);
+    } catch {
+      // Continue to seed
+    }
+  }
+
+  // Seed default rooms if not present
+  const defaultRooms: RoomConfig[] = [];
+  const defaultHallsByCinema = [
+    { cinemaId: 1, halls: ["Hall 1", "Hall 2", "Hall 3"] },
+    { cinemaId: 2, halls: ["Hall A", "Hall B"] },
+    { cinemaId: 3, halls: ["Hall X", "Hall Y"] },
+    { cinemaId: 4, halls: ["Hall I", "Hall II"] },
+    { cinemaId: 5, halls: ["Hall Alpha", "Hall Beta"] },
+    { cinemaId: 6, halls: ["Hall Gold", "Hall Silver"] }
+  ];
+
+  const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+  const rowsCount = 10;
+  const colsCount = 12;
+
+  defaultHallsByCinema.forEach((item) => {
+    item.halls.forEach((hallName, hIdx) => {
+      const seatsMap: Record<string, 'standard' | 'vip' | 'couple'> = {};
+      for (let r = 0; r < rowsCount; r++) {
+        const rowLetter = alphabet[r];
+        for (let c = 1; c <= colsCount; c++) {
+          const seatId = `${rowLetter}${c}`;
+          if (rowLetter === "J") {
+            seatsMap[seatId] = "couple";
+          } else if (["F", "G", "H"].includes(rowLetter)) {
+            seatsMap[seatId] = "vip";
+          } else {
+            seatsMap[seatId] = "standard";
+          }
+        }
+      }
+
+      defaultRooms.push({
+        id: `room-c${item.cinemaId}-${hIdx + 1}`,
+        name: hallName,
+        cinemaId: item.cinemaId,
+        rows: rowsCount,
+        cols: colsCount,
+        seats: seatsMap
+      });
+    });
+  });
+
+  localStorage.setItem("rooms_db", JSON.stringify(defaultRooms));
+  return defaultRooms;
+}
+
+export function saveRooms(rooms: RoomConfig[]) {
+  localStorage.setItem("rooms_db", JSON.stringify(rooms));
+}
+
+export function loadSeatPricing(): SeatPricingConfig {
+  const stored = localStorage.getItem("seat_pricing_db");
+  if (stored) {
+    try {
+      return JSON.parse(stored);
+    } catch {}
+  }
+  const defaultPricing = { vipMultiplier: 1.3, coupleMultiplier: 2.2 };
+  localStorage.setItem("seat_pricing_db", JSON.stringify(defaultPricing));
+  return defaultPricing;
+}
+
+export function saveSeatPricing(pricing: SeatPricingConfig) {
+  localStorage.setItem("seat_pricing_db", JSON.stringify(pricing));
+}
+
+export async function syncWithBackend(): Promise<boolean> {
+  try {
+    const online = await checkBackendOnline();
+    if (!online) {
+      console.log("Backend offline, running in mock mode (local storage).");
+      return false;
+    }
+
+    // 1. Sync showtimes
+    const showtimes = await getShowtimesAPI();
+    if (showtimes && showtimes.length > 0) {
+      const today = getLocalDateString(0);
+      if (showtimes.some((s: any) => s.date === today)) {
+        localStorage.setItem("showtimes_db", JSON.stringify(showtimes));
+      }
+    }
+
+    // 2. Sync tickets
+    const tickets = await getTicketsAPI();
+    if (tickets) {
+      localStorage.setItem("tickets_db", JSON.stringify(tickets));
+    }
+
+    // 3. Sync active seat locks from SQL Server/Backend memory
+    try {
+      const locks = await getSeatLocksAPI();
+      if (locks) {
+        localStorage.setItem("seat_locks_db", JSON.stringify(locks));
+      }
+    } catch (lockErr) {
+      console.warn("Failed to sync seat locks from backend:", lockErr);
+    }
+
+    console.log("Synchronized successfully with SQL Server!");
+    localStorage.setItem("backend_synced", "true");
+    window.dispatchEvent(new Event('db_synced'));
+    return true;
+  } catch (err: any) {
+    console.error("Failed to sync with backend database:", err.message);
+    localStorage.removeItem("backend_synced");
+    return false;
+  }
+}
+
+
